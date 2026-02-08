@@ -24,6 +24,7 @@ function App() {
   const [searchCoords, setSearchCoords] = useState(null); // { lat, lng } for API search
   const [mapCenter, setMapCenter] = useState(null);
   const [mapBounds, setMapBounds] = useState(null);
+  const [enrichProgress, setEnrichProgress] = useState(null); // { percent, message, current, total, phase }
   const searchCache = useRef({}); // { "lat,lng": { results, timestamp } }
   const { properties: dbProperties, loading, error, refetch } = useProperties();
 
@@ -69,33 +70,65 @@ function App() {
 
   async function handleTriggerPipeline() {
     setPipelineRunning(true);
+    setEnrichProgress(null);
     try {
       if (searchCoords) {
-        // Include filters in cache key so different filter combos don't share cache
         const cacheKey = `${searchCoords.lat.toFixed(4)},${searchCoords.lng.toFixed(4)}`;
         const filterKey = JSON.stringify(filters);
         const fullCacheKey = `${cacheKey}|${filterKey}`;
         const cached = searchCache.current[fullCacheKey];
 
         if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-          console.log(`Using cached results for ${fullCacheKey} (${Math.round((Date.now() - cached.timestamp) / 1000)}s old)`);
           setSearchResults(cached.results);
           if (cached.areaMedian) {
             setAreaMedian(cached.areaMedian);
             setAreaListingCount(cached.results.length);
           }
         } else {
-          const res = await axios.post('/api/properties/search', {
-            latitude: searchCoords.lat,
-            longitude: searchCoords.lng,
-            filters,
-          });
-          const { results, areaMedian: serverMedian } = res.data;
-          searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
-          setSearchResults(results || []);
-          if (serverMedian) {
-            setAreaMedian(serverMedian);
-            setAreaListingCount((results || []).length);
+          const needsEnrichment = filters.distressType === 'delinquent' || filters.distressType === 'taxLien';
+
+          if (needsEnrichment) {
+            // Use SSE stream for real-time progress
+            const params = new URLSearchParams({
+              latitude: searchCoords.lat,
+              longitude: searchCoords.lng,
+              filters: JSON.stringify(filters),
+            });
+            await new Promise((resolve, reject) => {
+              const es = new EventSource(`/api/properties/search/stream?${params}`);
+              es.addEventListener('progress', (e) => {
+                setEnrichProgress(JSON.parse(e.data));
+              });
+              es.addEventListener('results', (e) => {
+                const { results, areaMedian: serverMedian } = JSON.parse(e.data);
+                searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
+                setSearchResults(results || []);
+                if (serverMedian) {
+                  setAreaMedian(serverMedian);
+                  setAreaListingCount((results || []).length);
+                }
+                es.close();
+                resolve();
+              });
+              es.addEventListener('error', (e) => {
+                es.close();
+                reject(new Error('Stream error'));
+              });
+              es.onerror = () => { es.close(); reject(new Error('SSE connection error')); };
+            });
+          } else {
+            const res = await axios.post('/api/properties/search', {
+              latitude: searchCoords.lat,
+              longitude: searchCoords.lng,
+              filters,
+            });
+            const { results, areaMedian: serverMedian } = res.data;
+            searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
+            setSearchResults(results || []);
+            if (serverMedian) {
+              setAreaMedian(serverMedian);
+              setAreaListingCount((results || []).length);
+            }
           }
         }
       } else {
@@ -106,6 +139,7 @@ function App() {
       console.error('Pipeline trigger failed:', err);
     } finally {
       setPipelineRunning(false);
+      setEnrichProgress(null);
     }
   }
 
@@ -322,6 +356,38 @@ function App() {
             <div className="text-center bg-gray-900 border border-gray-700 rounded-xl px-8 py-6">
               <Loader2 className="w-8 h-8 animate-spin text-emerald-400 mx-auto mb-2" />
               <p className="text-gray-300 text-sm">Searching drawn area...</p>
+            </div>
+          </div>
+        )}
+
+        {enrichProgress && (
+          <div className="absolute inset-0 flex items-center justify-center bg-gray-950/70 z-50 backdrop-blur-sm">
+            <div className="bg-gray-900 border border-gray-700 rounded-2xl px-10 py-8 w-[420px] shadow-2xl">
+              <div className="flex items-center gap-3 mb-4">
+                <Loader2 className="w-5 h-5 animate-spin text-emerald-400 flex-shrink-0" />
+                <p className="text-white font-semibold text-base">
+                  {enrichProgress.phase === 'fetching' && 'Fetching Listings'}
+                  {enrichProgress.phase === 'fetched' && 'Listings Found'}
+                  {enrichProgress.phase === 'enriching' && 'Checking Distress Signals'}
+                  {enrichProgress.phase === 'done' && 'Complete'}
+                </p>
+              </div>
+              <div className="w-full bg-gray-800 rounded-full h-3 mb-3 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all duration-300 ease-out"
+                  style={{ width: `${enrichProgress.percent || 0}%` }}
+                />
+              </div>
+              <div className="flex justify-between items-center">
+                <p className="text-gray-400 text-sm truncate max-w-[280px]">
+                  {enrichProgress.message}
+                </p>
+                {enrichProgress.total && (
+                  <p className="text-gray-500 text-xs flex-shrink-0 ml-2">
+                    {enrichProgress.current}/{enrichProgress.total}
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         )}

@@ -422,8 +422,8 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
           disabled={pipelineRunning}
           className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium py-2.5 px-4 rounded-lg transition-colors"
         >
-          <RefreshCw className={`w-4 h-4 ${pipelineRunning ? 'animate-spin' : ''}`} />
-          {pipelineRunning ? 'Scanning...' : searchLabel ? `Find Deals in ${searchLabel}` : 'Find Deals'}
+          <Search className={`w-4 h-4 ${pipelineRunning ? 'animate-pulse' : ''}`} />
+          {pipelineRunning ? 'Scanning...' : 'Find Deals'}
         </button>
       </div>
 

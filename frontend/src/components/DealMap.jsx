@@ -4,7 +4,7 @@ import 'leaflet/dist/leaflet.css';
 import { Map, ChevronDown, Bed, Bath, Ruler, Clock, ExternalLink, Target, TrendingDown } from 'lucide-react';
 import DrawRectangle from './DrawRectangle';
 
-const DEFAULT_CENTER = [29.7604, -95.3698]; // Houston, TX
+const DEFAULT_CENTER = [25.7617, -80.1918]; // Miami, FL
 const DEFAULT_ZOOM = 11;
 
 const TILES = [

@@ -1,22 +1,24 @@
 const cron = require('node-cron');
-const { scrapeListings } = require('./scraper');
-const { enrichDeal } = require('./enrichmentService');
+const { searchByCoordinates } = require('./zillowService');
+const { enrichBatch, isWorthEnriching } = require('./enrichmentService');
+const { scoreDeal } = require('../utils/dealScorer');
 const Property = require('../models/Property');
 
-// Default search URL - can be overridden
-const DEFAULT_SEARCH_URL =
-  'https://www.realtor.com/realestateandhomes-search/Houston_TX/price-na-200000';
+// Default search: Miami, FL
+const DEFAULT_LOCATION = { lat: 25.7617, lng: -80.1918, radius: 10 };
 
 /**
- * Run the full pipeline: Scrape -> Enrich -> Score -> Save.
+ * Run the full pipeline: Zillow Search -> Enrich -> Score -> Save.
  */
-async function runPipeline(searchUrl = DEFAULT_SEARCH_URL) {
+async function runPipeline(location = DEFAULT_LOCATION) {
   console.log(`\n=== Pipeline started at ${new Date().toISOString()} ===`);
 
   try {
-    // 1. Scrape
-    console.log('Step 1: Scraping listings...');
-    const listings = await scrapeListings(searchUrl);
+    // 1. Fetch listings from Zillow RapidAPI
+    console.log(`Step 1: Fetching Zillow listings near [${location.lat}, ${location.lng}]...`);
+    const { properties: listings } = await searchByCoordinates(
+      location.lat, location.lng, location.radius || 10
+    );
     console.log(`  Found ${listings.length} listings`);
 
     if (listings.length === 0) {
@@ -24,18 +26,26 @@ async function runPipeline(searchUrl = DEFAULT_SEARCH_URL) {
       return { scraped: 0, enriched: 0, saved: 0 };
     }
 
-    // 2. Enrich + Score
-    console.log('Step 2: Enriching with ATTOM + Datafiniti...');
-    const enriched = [];
+    // 2. Pre-fill market median for scoring
+    const prices = listings.map((l) => l.price).filter((p) => p && p > 0);
+    const areaMedian = prices.length > 0
+      ? [...prices].sort((a, b) => a - b)[Math.floor(prices.length / 2)]
+      : 0;
+    for (const l of listings) {
+      if (!l.marketMedian && areaMedian > 0) l.marketMedian = areaMedian;
+    }
+
+    // Filter to promising listings, batch enrich top candidates
+    const candidates = listings.filter(isWorthEnriching);
+    console.log(`Step 2: ${candidates.length}/${listings.length} look promising, enriching top candidates...`);
+    const enriched = await enrichBatch(candidates, (current, total, street) => {
+      console.log(`  [${current}/${total}] ${street}`);
+    });
+
+    // Score the rest that weren't enriched
     for (const listing of listings) {
-      try {
-        const result = await enrichDeal(listing);
-        enriched.push(result);
-        console.log(
-          `  ${result.address.street}: score=${result.dealScore}, delinquent=${result.distressIndicators.isDelinquent}, lien=${result.distressIndicators.hasTaxLien}`
-        );
-      } catch (err) {
-        console.error(`  Failed to enrich ${listing.address?.street}:`, err.message);
+      if (!listing.enriched) {
+        listing.dealScore = scoreDeal(listing);
       }
     }
 
@@ -84,17 +94,17 @@ async function runPipeline(searchUrl = DEFAULT_SEARCH_URL) {
 /**
  * Start the cron job: runs every 30 minutes.
  */
-function startCronPipeline(searchUrl = DEFAULT_SEARCH_URL) {
+function startCronPipeline(location = DEFAULT_LOCATION) {
   console.log('Cron pipeline scheduled: every 30 minutes');
 
   // Run immediately on startup
-  runPipeline(searchUrl).catch((err) =>
+  runPipeline(location).catch((err) =>
     console.error('Initial pipeline run failed:', err.message)
   );
 
   // Then every 30 minutes
   cron.schedule('*/30 * * * *', () => {
-    runPipeline(searchUrl).catch((err) =>
+    runPipeline(location).catch((err) =>
       console.error('Cron pipeline run failed:', err.message)
     );
   });

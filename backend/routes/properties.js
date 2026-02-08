@@ -3,7 +3,7 @@ const router = express.Router();
 const Property = require('../models/Property');
 const { runPipeline } = require('../services/pipeline');
 const { searchByCoordinates } = require('../services/zillowService');
-const { enrichDeal } = require('../services/enrichmentService');
+const { enrichBatch, isWorthEnriching } = require('../services/enrichmentService');
 const { scoreDeal } = require('../utils/dealScorer');
 
 // GET /api/properties - List all scored properties
@@ -95,24 +95,21 @@ router.post('/search', async (req, res) => {
     const areaMedian = median(prices);
     console.log(`Search: area median = $${areaMedian.toLocaleString()} from ${prices.length} listings`);
 
-    // --- Phase 3: Backfill marketMedian, enrich if needed, score, and filter ---
+    // --- Phase 3: Backfill marketMedian, batch enrich, score, and filter ---
     let results = [];
 
     for (const listing of allListings) {
-      try {
-        // Use Zestimate if available, otherwise use area median as market benchmark
-        if (!listing.marketMedian && areaMedian > 0) {
-          listing.marketMedian = areaMedian;
-        }
+      if (!listing.marketMedian && areaMedian > 0) listing.marketMedian = areaMedian;
+    }
 
-        // Run enrichment if delinquent/taxLien filter is active
-        if (needsEnrichment && !listing.enriched) {
-          try {
-            await enrichDeal(listing);
-          } catch (enrichErr) {
-            console.error(`Enrichment failed for ${listing.address?.street}:`, enrichErr.message);
-          }
-        }
+    if (needsEnrichment) {
+      const candidates = allListings.filter((l) => !l.enriched && isWorthEnriching(l));
+      console.log(`Batch enriching ${candidates.length} of ${allListings.length} listings`);
+      await enrichBatch(candidates);
+    }
+
+    for (const listing of allListings) {
+      try {
 
         // Distress filters (require enrichment data)
         if (distressType === 'delinquent' && !listing.distressIndicators?.isDelinquent) continue;
@@ -157,6 +154,131 @@ router.post('/search', async (req, res) => {
   }
 });
 
+// GET /api/properties/search/stream - SSE search with progress updates
+router.get('/search/stream', async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+
+  function send(event, data) {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  try {
+    const { latitude, longitude, radius, filters: filtersJson } = req.query;
+    if (!latitude || !longitude) {
+      send('error', { error: 'latitude and longitude are required' });
+      return res.end();
+    }
+
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    const rad = parseFloat(radius) || 10;
+    const filters = filtersJson ? JSON.parse(filtersJson) : {};
+    const { propertyType, distressType, minScore, minDiscount } = filters;
+    const needsEnrichment = distressType === 'delinquent' || distressType === 'taxLien';
+
+    send('progress', { phase: 'fetching', message: 'Fetching listings...', percent: 5 });
+
+    // Phase 1: Fetch listings
+    const MAX_PAGES = 3;
+    const MIN_RESULTS = 20;
+    let allListings = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore && page <= MAX_PAGES) {
+      const { properties: rawListings, hasMore: morePages } = await searchByCoordinates(
+        lat, lng, rad, { page }
+      );
+
+      for (const listing of rawListings) {
+        if (propertyType && listing.propertyType !== propertyType) continue;
+        if (distressType === 'preForeclosure' && listing.listingStatus !== 'preForeclosure') continue;
+        if (distressType === 'asIs' && !listing.distressIndicators?.isAsIs) continue;
+        allListings.push(listing);
+      }
+
+      hasMore = morePages;
+      const hasActiveFilter = propertyType || distressType || minScore || minDiscount;
+      if (!hasActiveFilter || allListings.length >= MIN_RESULTS) break;
+      page++;
+    }
+
+    // Phase 2: Area median + pre-fill market values
+    const prices = allListings.map((l) => l.price).filter((p) => p && p > 0);
+    const areaMedian = median(prices);
+    for (const listing of allListings) {
+      if (!listing.marketMedian && areaMedian > 0) listing.marketMedian = areaMedian;
+    }
+
+    // Phase 3: Batch enrich only promising listings
+    const candidates = needsEnrichment
+      ? allListings.filter((l) => !l.enriched && isWorthEnriching(l))
+      : [];
+
+    send('progress', {
+      phase: 'fetched',
+      message: `Found ${allListings.length} listings, ${candidates.length} to check`,
+      percent: 15,
+    });
+
+    let results = [];
+
+    if (candidates.length > 0) {
+      await enrichBatch(candidates, (current, total, street) => {
+        const percent = 15 + Math.round((current / total) * 80);
+        send('progress', {
+          phase: 'enriching',
+          message: `Checking ${street || 'property'}...`,
+          current,
+          total,
+          percent,
+        });
+      });
+    }
+
+    for (const listing of allListings) {
+      try {
+        if (distressType === 'delinquent' && !listing.distressIndicators?.isDelinquent) continue;
+        if (distressType === 'taxLien' && !listing.distressIndicators?.hasTaxLien) continue;
+
+        listing.dealScore = scoreDeal(listing);
+
+        if (minScore && listing.dealScore < minScore) continue;
+        if (minDiscount && listing.price && listing.marketMedian && listing.marketMedian > 0) {
+          const discount = ((listing.marketMedian - listing.price) / listing.marketMedian) * 100;
+          if (discount < minDiscount) continue;
+        }
+
+        if (listing.dealScore > 50) {
+          const saved = await Property.findOneAndUpdate(
+            { 'address.street': listing.address.street, 'address.zip': listing.address.zip },
+            listing,
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+          );
+          results.push(saved);
+        } else {
+          results.push(listing);
+        }
+      } catch (innerErr) {
+        results.push(listing);
+      }
+    }
+
+    results.sort((a, b) => (b.dealScore || 0) - (a.dealScore || 0));
+
+    send('progress', { phase: 'done', message: 'Complete', percent: 100 });
+    send('results', { results, areaMedian, geo: { lat, lng } });
+  } catch (err) {
+    send('error', { error: err.message });
+  } finally {
+    res.end();
+  }
+});
+
 // GET /api/properties/:id - Single property
 router.get('/:id', async (req, res) => {
   try {
@@ -171,8 +293,11 @@ router.get('/:id', async (req, res) => {
 // POST /api/properties/pipeline - Manually trigger the pipeline
 router.post('/pipeline', async (req, res) => {
   try {
-    const { searchUrl } = req.body;
-    const result = await runPipeline(searchUrl || undefined);
+    const { latitude, longitude, radius } = req.body;
+    const location = latitude && longitude
+      ? { lat: latitude, lng: longitude, radius: radius || 10 }
+      : undefined;
+    const result = await runPipeline(location);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });

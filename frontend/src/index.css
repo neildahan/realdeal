@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Hide scrollbar for carousel */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Dark popup styling for map listing cards */
+.deal-popup .leaflet-popup-content-wrapper {
+  background: transparent;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  border-radius: 0.5rem;
+  padding: 0;
+}
+
+.deal-popup .leaflet-popup-content {
+  margin: 0;
+  line-height: normal;
+}
+
+.deal-popup .leaflet-popup-tip {
+  background: #1f2937;
+}
+
+.deal-popup .leaflet-popup-close-button {
+  color: #9ca3af;
+  z-index: 10;
+  top: 4px !important;
+  right: 4px !important;
+  width: 20px;
+  height: 20px;
+  font-size: 16px;
+  line-height: 20px;
+}
+
+.deal-popup .leaflet-popup-close-button:hover {
+  color: #fff;
+}

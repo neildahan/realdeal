@@ -36,7 +36,7 @@ const PROPERTY_TYPE_OPTIONS = [
   { value: 'manufactured', label: 'Manufactured' },
 ];
 
-export default function Sidebar({ filters, setFilters, properties, onTriggerPipeline, pipelineRunning, onLocationSearch, searchLoading, searchLabel, onClearSearch, drawMode, onToggleDrawMode, drawnBounds, onClearDraw, areaMedian, areaListingCount, drawSearchLoading, onSearchDrawnArea, hasSearchResults, medianRange }) {
+export default function Sidebar({ filters, setFilters, properties, onTriggerPipeline, pipelineRunning, onLocationSearch, searchLoading, searchLabel, onClearSearch, drawMode, onToggleDrawMode, drawnBounds, onClearDraw, areaMedian, areaListingCount, drawSearchLoading, onSearchDrawnArea, hasSearchResults, medianRange, hasLocation }) {
   const [searchInput, setSearchInput] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -144,52 +144,39 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
           <MapPin className="w-3 h-3 inline mr-1" />
           Search by Location
         </label>
-        <div className="flex gap-2">
-          <div className="flex-1 relative" ref={wrapperRef}>
-            <input
-              type="text"
-              value={searchInput}
-              onChange={(e) => handleInputChange(e.target.value)}
-              onFocus={handleInputFocus}
-              placeholder="Zip, neighborhood, or city..."
-              className="w-full bg-gray-800 text-gray-200 text-sm rounded-lg px-3 py-2 border border-gray-700 focus:border-emerald-500 focus:outline-none placeholder-gray-600"
-            />
-            {showSuggestions && (
-              <div className="absolute top-full left-0 right-0 mt-1 bg-gray-800 border border-gray-700 rounded-lg overflow-hidden shadow-xl z-50 max-h-56 overflow-y-auto">
-                {suggestions.length > 0 && suggestions[0].isRecent && (
-                  <div className="px-3 py-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider border-b border-gray-700">
-                    Recent Searches
-                  </div>
-                )}
-                {suggestions.map((s, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => handleSelectSuggestion(s)}
-                    className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
-                  >
-                    {s.isRecent ? (
-                      <Clock className="w-3 h-3 text-gray-500 shrink-0" />
-                    ) : (
-                      <MapPin className="w-3 h-3 text-gray-500 shrink-0" />
-                    )}
-                    <span className="truncate">{s.label}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <button
-            type="submit"
-            disabled={searchInput.trim().length < 2 || searchLoading}
-            className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium px-3 py-2 rounded-lg transition-colors"
-          >
-            {searchLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Search className="w-4 h-4" />
-            )}
-          </button>
+        <div className="relative" ref={wrapperRef}>
+          <input
+            type="text"
+            value={searchInput}
+            onChange={(e) => handleInputChange(e.target.value)}
+            onFocus={handleInputFocus}
+            placeholder="Zip, neighborhood, or city..."
+            className="w-full bg-gray-800 text-gray-200 text-sm rounded-lg px-3 py-2 border border-gray-700 focus:border-emerald-500 focus:outline-none placeholder-gray-600"
+          />
+          {showSuggestions && (
+            <div className="absolute top-full left-0 right-0 mt-1 bg-gray-800 border border-gray-700 rounded-lg overflow-hidden shadow-xl z-50 max-h-56 overflow-y-auto">
+              {suggestions.length > 0 && suggestions[0].isRecent && (
+                <div className="px-3 py-1.5 text-[10px] font-semibold text-gray-500 uppercase tracking-wider border-b border-gray-700">
+                  Recent Searches
+                </div>
+              )}
+              {suggestions.map((s, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => handleSelectSuggestion(s)}
+                  className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 hover:text-white transition-colors flex items-center gap-2"
+                >
+                  {s.isRecent ? (
+                    <Clock className="w-3 h-3 text-gray-500 shrink-0" />
+                  ) : (
+                    <MapPin className="w-3 h-3 text-gray-500 shrink-0" />
+                  )}
+                  <span className="truncate">{s.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </form>
 
@@ -384,6 +371,15 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
               <div className="border-t border-gray-700 pt-1.5 flex justify-between text-gray-300 font-semibold">
                 <span>Max score</span><span>100 pts</span>
               </div>
+              <div className="border-t border-gray-700 pt-1.5 mt-1.5">
+                <p className="text-gray-300 font-semibold mb-1">Valuation Sources</p>
+                <div className="space-y-0.5 text-[10px]">
+                  <div className="flex justify-between"><span>Zillow + RentCast comps</span><span className="text-emerald-400">High confidence</span></div>
+                  <div className="flex justify-between"><span>Zillow per-property</span><span className="text-blue-400">Medium confidence</span></div>
+                  <div className="flex justify-between"><span>Zillow search zestimate</span><span className="text-blue-400">Medium confidence</span></div>
+                  <div className="flex justify-between"><span>$/sqft median estimate</span><span className="text-gray-500">Low confidence</span></div>
+                </div>
+              </div>
             </div>
           )}
           <input
@@ -406,11 +402,15 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
       <div className="p-4 border-b border-gray-800">
         <button
           onClick={onTriggerPipeline}
-          disabled={pipelineRunning}
+          disabled={pipelineRunning || (!hasLocation && !drawnBounds)}
           className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium py-2.5 px-4 rounded-lg transition-colors"
         >
-          <Search className={`w-4 h-4 ${pipelineRunning ? 'animate-pulse' : ''}`} />
-          {pipelineRunning ? 'Scanning...' : 'Find Deals'}
+          {pipelineRunning ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Search className="w-4 h-4" />
+          )}
+          {pipelineRunning ? 'Searching...' : 'Find Deals'}
         </button>
       </div>
 

@@ -1,16 +1,14 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useCallback } from 'react';
 import axios from 'axios';
-
-const POLL_INTERVAL = 15000; // 15 seconds
 
 export function useProperties() {
   const [properties, setProperties] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const intervalRef = useRef(null);
 
   const fetchProperties = useCallback(async () => {
     try {
+      setLoading(true);
       const res = await axios.get('/api/properties');
       setProperties(res.data);
       setError(null);
@@ -20,15 +18,6 @@ export function useProperties() {
       setLoading(false);
     }
   }, []);
-
-  useEffect(() => {
-    setLoading(true);
-    fetchProperties();
-
-    // Poll for real-time updates
-    intervalRef.current = setInterval(fetchProperties, POLL_INTERVAL);
-    return () => clearInterval(intervalRef.current);
-  }, [fetchProperties]);
 
   return { properties, loading, error, refetch: fetchProperties };
 }

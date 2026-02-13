@@ -46,6 +46,32 @@ const propertySchema = new mongoose.Schema(
     zestimate: { type: Number, default: null },
     rentZestimate: { type: Number, default: null },
 
+    // Valuation metadata (3-tier pipeline)
+    valuationSource: {
+      type: String,
+      enum: ['zillow_search', 'zillow_per_property', 'rentcast', 'zillow+rentcast', 'ppsf_median'],
+      default: 'ppsf_median',
+    },
+    valuationConfidence: {
+      type: String,
+      enum: ['low', 'medium', 'high'],
+      default: 'low',
+    },
+    rentcastAVM: {
+      value: { type: Number, default: null },
+      valueHigh: { type: Number, default: null },
+      valueLow: { type: Number, default: null },
+      comparables: [
+        {
+          address: String,
+          price: Number,
+          sqft: Number,
+          distance: Number,
+          saleDate: String,
+        },
+      ],
+    },
+
     // Computed deal score (0-100)
     dealScore: { type: Number, default: 0 },
 

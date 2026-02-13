@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, CircleMarker, Popup, useMap, Rectangle } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Map, ChevronDown, Bed, Bath, Ruler, Clock, ExternalLink, Target, TrendingDown } from 'lucide-react';
 import DrawRectangle from './DrawRectangle';
@@ -55,7 +55,7 @@ function MapController({ center, bounds }) {
   return null;
 }
 
-export default function DealMap({ properties, center: centerProp, bounds: boundsProp, drawMode, drawnBounds, onDrawComplete }) {
+export default function DealMap({ properties, center: centerProp, bounds: boundsProp, areaBounds, drawMode, drawnBounds, onDrawComplete }) {
   const [tileId, setTileId] = useState('voyager');
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const tile = TILES.find((t) => t.id === tileId) || TILES[0];
@@ -111,6 +111,19 @@ export default function DealMap({ properties, center: centerProp, bounds: bounds
           url={tile.url}
         />
         <DrawRectangle drawMode={drawMode} drawnBounds={drawnBounds} onDrawComplete={onDrawComplete} />
+        {areaBounds && !drawnBounds && (
+          <Rectangle
+            bounds={areaBounds}
+            pathOptions={{
+              color: '#34d399',
+              weight: 3,
+              opacity: 1,
+              fillColor: '#34d399',
+              fillOpacity: 0.1,
+              dashArray: '6 4',
+            }}
+          />
+        )}
 
       {properties.map((property) => {
         const coords = property.coordinates?.coordinates;
@@ -242,6 +255,18 @@ export default function DealMap({ properties, center: centerProp, bounds: bounds
                     )}
                     {property.distressIndicators?.isPreForeclosure && (
                       <span className="bg-red-500/20 text-red-400 px-1.5 py-0.5 rounded text-[10px]">Pre-Foreclosure</span>
+                    )}
+                    {/* Valuation source badge */}
+                    {property.valuationSource === 'zillow+rentcast' && (
+                      <span className="bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">
+                        {property.rentcastAVM?.comparables?.length || 0} comps verified
+                      </span>
+                    )}
+                    {property.valuationSource === 'zillow_per_property' && (
+                      <span className="bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded text-[10px]">Zillow verified</span>
+                    )}
+                    {property.valuationSource === 'ppsf_median' && (
+                      <span className="bg-gray-500/20 text-gray-500 px-1.5 py-0.5 rounded text-[10px]">est.</span>
                     )}
                   </div>
 

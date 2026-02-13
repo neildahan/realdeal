@@ -3,8 +3,8 @@ const router = express.Router();
 const Property = require('../models/Property');
 const { runPipeline } = require('../services/pipeline');
 const { searchByCoordinates } = require('../services/zillowService');
-const { enrichBatch, isWorthEnriching } = require('../services/enrichmentService');
-const { scoreDeal } = require('../utils/dealScorer');
+const { enrichBatch, isWorthEnriching, refineBatchValuations, validateTopDeals } = require('../services/enrichmentService');
+const { scoreDeal, computeValuationMeta } = require('../utils/dealScorer');
 
 // GET /api/properties - List all scored properties
 router.get('/', async (req, res) => {
@@ -67,6 +67,31 @@ function isZestimateReliable(zestimate, listing) {
     const zestPpsf = zestimate / listing.sqft;
     if (zestPpsf > 2000) return false; // No US condo is genuinely $2,000+/sqft in most markets
   }
+  return true;
+}
+
+/**
+ * Check if a property's valuation is trustworthy enough to persist to DB.
+ * Prevents saving garbage estimates that haunt future page loads.
+ */
+function isWorthSaving(listing) {
+  // Must have a deal score worth saving
+  if (!listing.dealScore || listing.dealScore <= 50) return false;
+
+  // If valuation came from a real source (not just a statistical guess), trust it
+  const source = listing.valuationSource;
+  if (source === 'zillow_search' || source === 'zillow_per_property' ||
+      source === 'rentcast' || source === 'zillow+rentcast') {
+    return true;
+  }
+
+  // For ppsf_median (statistical estimate): sanity check the implied discount.
+  // A -60%+ "discount" on an unverified estimate is almost certainly a bad estimate, not a deal.
+  if (listing.price && listing.marketMedian && listing.marketMedian > 0) {
+    const ratio = listing.price / listing.marketMedian;
+    if (ratio < 0.4) return false; // Implied >60% discount on unverified estimate = don't save
+  }
+
   return true;
 }
 
@@ -152,15 +177,31 @@ function estimateMarketValue(listing, marketData) {
   const type = listing.propertyType || 'unknown';
   const key = `${zip}|${type}`;
   const sqft = listing.sqft;
+  const priceMedian = priceMedians_zipType[key] || priceMedians_zip[zip] || areaPriceMedian || 0;
 
-  // 2. $/sqft estimate (size-adjusted)
+  // 2. $/sqft estimate (size-adjusted) — cross-validated against price median
   if (sqft && sqft > 0) {
     const ppsf = ppsfMedians_zipType[key] || ppsfMedians_zip[zip] || areaPpsfMedian;
-    if (ppsf > 0) return Math.round(ppsf * sqft);
+    if (ppsf > 0) {
+      const ppsfEstimate = Math.round(ppsf * sqft);
+      if (priceMedian > 0) {
+        const divergence = ppsfEstimate / priceMedian;
+        // Extreme divergence (>3x): $/sqft is completely unreliable for this property size,
+        // just use price median (e.g., 650sqft condo in zip with luxury towers)
+        if (divergence > 3 || divergence < 0.25) {
+          return priceMedian;
+        }
+        // Moderate divergence (>1.5x): blend toward price median
+        if (divergence > 1.5 || divergence < 0.5) {
+          return Math.round(priceMedian * 0.7 + ppsfEstimate * 0.3);
+        }
+      }
+      return ppsfEstimate;
+    }
   }
 
   // 3. Raw price median fallback
-  return priceMedians_zipType[key] || priceMedians_zip[zip] || areaPriceMedian || 0;
+  return priceMedian;
 }
 
 // POST /api/properties/search - Search by location via Zillow (with server-side filtering)
@@ -210,28 +251,41 @@ router.post('/search', async (req, res) => {
     const areaMedian = marketData.areaPriceMedian;
     console.log(`Search: $/sqft medians — ${Object.keys(marketData.ppsfMedians_zipType).length} zip+type, ${Object.keys(marketData.ppsfMedians_zip).length} zip, area $/sqft = $${Math.round(marketData.areaPpsfMedian)}`);
 
-    // --- Phase 3: Estimate market value per listing, enrich, score, and filter ---
-    let results = [];
-
+    // --- Phase 3: Estimate market value per listing, preliminary score ---
     for (const listing of allListings) {
       listing.marketMedian = estimateMarketValue(listing, marketData);
+      // Tag valuation source from Tier 1
+      if (isZestimateReliable(listing.zestimate, listing)) {
+        listing.valuationSource = 'zillow_search';
+      } else {
+        listing.valuationSource = 'ppsf_median';
+      }
+      listing.dealScore = scoreDeal(listing);
+      const meta = computeValuationMeta(listing);
+      listing.valuationConfidence = meta.confidence;
     }
 
+    // --- Tier 2: Refine valuations for top candidates missing zestimates ---
+    await refineBatchValuations(allListings);
+
+    // --- Tier 3a: Batch enrich only if distress filter is active ---
     if (needsEnrichment) {
       const candidates = allListings.filter((l) => !l.enriched && isWorthEnriching(l));
       console.log(`Batch enriching ${candidates.length} of ${allListings.length} listings`);
       await enrichBatch(candidates);
     }
 
+    // --- Tier 3b: Validate top deals with RentCast ---
+    await validateTopDeals(allListings);
+
+    // --- Phase 4: Filter and save ---
+    let results = [];
+
     for (const listing of allListings) {
       try {
-
         // Distress filters (require enrichment data)
         if (distressType === 'delinquent' && !listing.distressIndicators?.isDelinquent) continue;
         if (distressType === 'taxLien' && !listing.distressIndicators?.hasTaxLien) continue;
-
-        // Score the deal (now with marketMedian set)
-        listing.dealScore = scoreDeal(listing);
 
         // Min score filter
         if (minScore && listing.dealScore < minScore) continue;
@@ -242,8 +296,8 @@ router.post('/search', async (req, res) => {
           if (discount < minDiscount) continue;
         }
 
-        // Save deals with score > 50 to DB
-        if (listing.dealScore > 50) {
+        // Only save to DB if valuation is trustworthy (prevents stale bad estimates)
+        if (isWorthSaving(listing)) {
           const saved = await Property.findOneAndUpdate(
             { 'address.street': listing.address.street, 'address.zip': listing.address.zip },
             listing,
@@ -322,29 +376,44 @@ router.get('/search/stream', async (req, res) => {
       page++;
     }
 
-    // Phase 2: Compute $/sqft market data for per-property estimates
+    // Phase 2: Compute $/sqft market data + preliminary score
     const marketData = computeMarketData(allListings);
     const areaMedian = marketData.areaPriceMedian;
     for (const listing of allListings) {
       listing.marketMedian = estimateMarketValue(listing, marketData);
+      listing.valuationSource = isZestimateReliable(listing.zestimate, listing) ? 'zillow_search' : 'ppsf_median';
+      listing.dealScore = scoreDeal(listing);
+      const meta = computeValuationMeta(listing);
+      listing.valuationConfidence = meta.confidence;
     }
-
-    // Phase 3: Batch enrich only promising listings
-    const candidates = needsEnrichment
-      ? allListings.filter((l) => !l.enriched && isWorthEnriching(l))
-      : [];
 
     send('progress', {
       phase: 'fetched',
-      message: `Found ${allListings.length} listings, ${candidates.length} to check`,
+      message: `Found ${allListings.length} listings`,
       percent: 15,
     });
 
-    let results = [];
+    // Tier 2: Refine valuations for top candidates
+    send('progress', { phase: 'refining', message: 'Refining valuations...', percent: 20 });
+    await refineBatchValuations(allListings, (current, total, street) => {
+      const percent = 20 + Math.round((current / total) * 25);
+      send('progress', {
+        phase: 'refining',
+        message: `Checking ${street || 'property'}...`,
+        current,
+        total,
+        percent,
+      });
+    });
 
-    if (candidates.length > 0) {
-      await enrichBatch(candidates, (current, total, street) => {
-        const percent = 15 + Math.round((current / total) * 80);
+    // Tier 3a: Batch enrich if distress filter active
+    const enrichCandidates = needsEnrichment
+      ? allListings.filter((l) => !l.enriched && isWorthEnriching(l))
+      : [];
+
+    if (enrichCandidates.length > 0) {
+      await enrichBatch(enrichCandidates, (current, total, street) => {
+        const percent = 45 + Math.round((current / total) * 30);
         send('progress', {
           phase: 'enriching',
           message: `Checking ${street || 'property'}...`,
@@ -355,12 +424,26 @@ router.get('/search/stream', async (req, res) => {
       });
     }
 
+    // Tier 3b: RentCast validation for top deals
+    send('progress', { phase: 'validating', message: 'Validating top deals...', percent: 80 });
+    await validateTopDeals(allListings, (current, total, street) => {
+      const percent = 80 + Math.round((current / total) * 15);
+      send('progress', {
+        phase: 'validating',
+        message: `Verifying ${street || 'property'}...`,
+        current,
+        total,
+        percent,
+      });
+    });
+
+    // Phase 4: Filter and save
+    let results = [];
+
     for (const listing of allListings) {
       try {
         if (distressType === 'delinquent' && !listing.distressIndicators?.isDelinquent) continue;
         if (distressType === 'taxLien' && !listing.distressIndicators?.hasTaxLien) continue;
-
-        listing.dealScore = scoreDeal(listing);
 
         if (minScore && listing.dealScore < minScore) continue;
         if (minDiscount && listing.price && listing.marketMedian && listing.marketMedian > 0) {

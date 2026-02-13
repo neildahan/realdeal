@@ -1,9 +1,12 @@
 const { fetchAttomData } = require('./attomService');
 const { fetchDatafinitiData, fetchDatafinitiBatch } = require('./datafinitiService');
 const { fetchZillowData } = require('./zillowService');
-const { scoreDeal } = require('../utils/dealScorer');
+const { fetchRentCastAVM } = require('./rentcastService');
+const { scoreDeal, computeValuationMeta } = require('../utils/dealScorer');
 
 const MAX_ENRICH = 15; // Max properties to enrich per search
+const MAX_ZILLOW_REFINE = 20; // Max per-property Zillow lookups (Tier 2)
+const MAX_RENTCAST = 2; // Max RentCast AVM calls (Tier 3)
 
 /**
  * Check if a property looks like a potential deal worth enriching.
@@ -150,4 +153,112 @@ async function enrichBatch(properties, onProgress) {
   return batch;
 }
 
-module.exports = { enrichDeal, isWorthEnriching, enrichBatch, MAX_ENRICH };
+/**
+ * Tier 2: Refine valuations by fetching per-property Zillow data for
+ * the top candidates missing a reliable zestimate.
+ *
+ * @param {Array} properties - all listings (mutated in place)
+ * @param {Function} onProgress - optional callback(current, total, address)
+ * @returns {number} count of properties refined
+ */
+async function refineBatchValuations(properties, onProgress) {
+  // Filter to properties without a per-property zestimate
+  const missing = properties.filter((p) => !p.zestimate || p.valuationSource === 'ppsf_median');
+
+  // Sort by preliminary deal score descending (best candidates first)
+  missing.sort((a, b) => (b.dealScore || 0) - (a.dealScore || 0));
+  const batch = missing.slice(0, MAX_ZILLOW_REFINE);
+
+  if (batch.length === 0) return 0;
+  console.log(`Tier 2: Refining valuations for ${batch.length} candidates`);
+
+  let refined = 0;
+  for (let i = 0; i < batch.length; i++) {
+    const property = batch[i];
+    if (onProgress) onProgress(i + 1, batch.length, property.address?.street);
+
+    try {
+      const zillow = await fetchZillowData(property.address);
+      if (zillow?.zestimate && zillow.zestimate > 0) {
+        // Sanity check: zestimate shouldn't be wildly off from listing price
+        const ratio = zillow.zestimate / property.price;
+        if (ratio >= 0.4 && ratio <= 2.5) {
+          property.zestimate = zillow.zestimate;
+          property.marketMedian = zillow.zestimate;
+          property.valuationSource = 'zillow_per_property';
+          property.rentZestimate = zillow.rentZestimate || property.rentZestimate;
+          property.dealScore = scoreDeal(property);
+          const meta = computeValuationMeta(property);
+          property.valuationConfidence = meta.confidence;
+          refined++;
+        } else {
+          console.log(`Tier 2: Zestimate for "${property.address?.street}" failed sanity (ratio: ${ratio.toFixed(2)})`);
+        }
+      }
+    } catch (err) {
+      console.error(`Tier 2: Failed for "${property.address?.street}":`, err.message);
+    }
+  }
+
+  console.log(`Tier 2: Refined ${refined} of ${batch.length} properties`);
+  return refined;
+}
+
+/**
+ * Tier 3: Validate top deal candidates with RentCast AVM + sold comps.
+ * Only called for the best deals to confirm they're real.
+ *
+ * @param {Array} properties - all listings (mutated in place)
+ * @param {Function} onProgress - optional callback(current, total, address)
+ * @returns {number} count of properties validated
+ */
+async function validateTopDeals(properties, onProgress) {
+  // Filter to high-score candidates worth validating
+  const candidates = properties
+    .filter((p) => (p.dealScore || 0) >= 70)
+    .sort((a, b) => (b.dealScore || 0) - (a.dealScore || 0))
+    .slice(0, MAX_RENTCAST);
+
+  if (candidates.length === 0) return 0;
+  console.log(`Tier 3: RentCast validation for ${candidates.length} deals`);
+
+  let validated = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const property = candidates[i];
+    if (onProgress) onProgress(i + 1, candidates.length, property.address?.street);
+
+    try {
+      const avm = await fetchRentCastAVM(property.address);
+      if (!avm || !avm.value) continue;
+
+      property.rentcastAVM = avm;
+
+      // Weighted average: if we have both Zillow zestimate and RentCast, blend them
+      if (property.zestimate && property.zestimate > 0) {
+        // 60% Zillow, 40% RentCast
+        property.marketMedian = Math.round(property.zestimate * 0.6 + avm.value * 0.4);
+        property.valuationSource = 'zillow+rentcast';
+      } else {
+        property.marketMedian = avm.value;
+        property.valuationSource = 'rentcast';
+      }
+
+      property.dealScore = scoreDeal(property);
+      const meta = computeValuationMeta(property);
+      property.valuationConfidence = meta.confidence;
+      validated++;
+
+      console.log(`Tier 3: "${property.address?.street}" → RentCast $${avm.value}, final market $${property.marketMedian}, score ${property.dealScore}`);
+    } catch (err) {
+      console.error(`Tier 3: Failed for "${property.address?.street}":`, err.message);
+    }
+  }
+
+  console.log(`Tier 3: Validated ${validated} of ${candidates.length} deals`);
+  return validated;
+}
+
+module.exports = {
+  enrichDeal, isWorthEnriching, enrichBatch, MAX_ENRICH,
+  refineBatchValuations, validateTopDeals, MAX_ZILLOW_REFINE, MAX_RENTCAST,
+};

@@ -46,4 +46,28 @@ function scoreDeal(property) {
   return Math.min(score, 100);
 }
 
-module.exports = { scoreDeal };
+/**
+ * Compute valuation metadata for frontend display.
+ * Returns source label, confidence level, and comp count.
+ */
+function computeValuationMeta(property) {
+  const source = property.valuationSource || 'ppsf_median';
+  const comps = property.rentcastAVM?.comparables?.length || 0;
+
+  let confidence;
+  if (source === 'zillow+rentcast') {
+    confidence = 'high';
+  } else if (source === 'rentcast') {
+    confidence = 'high';
+  } else if (source === 'zillow_per_property') {
+    confidence = 'medium';
+  } else if (source === 'zillow_search') {
+    confidence = 'medium';
+  } else {
+    confidence = 'low';
+  }
+
+  return { source, confidence, compCount: comps };
+}
+
+module.exports = { scoreDeal, computeValuationMeta };

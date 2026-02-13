@@ -103,13 +103,29 @@ export function estimateMarketValue(property, marketData) {
   const type = property.propertyType || 'unknown';
   const key = `${zip}|${type}`;
   const sqft = property.sqft;
+  const priceMedian = priceMedians_zipType[key] || priceMedians_zip[zip] || areaPriceMedian || 0;
 
+  // $/sqft estimate, cross-validated against price median
   if (sqft && sqft > 0) {
     const ppsf = ppsfMedians_zipType[key] || ppsfMedians_zip[zip] || areaPpsfMedian;
-    if (ppsf > 0) return Math.round(ppsf * sqft);
+    if (ppsf > 0) {
+      const ppsfEstimate = Math.round(ppsf * sqft);
+      if (priceMedian > 0) {
+        const divergence = ppsfEstimate / priceMedian;
+        // Extreme divergence: $/sqft completely unreliable for this size, use price median
+        if (divergence > 3 || divergence < 0.25) {
+          return priceMedian;
+        }
+        // Moderate divergence: blend toward price median
+        if (divergence > 1.5 || divergence < 0.5) {
+          return Math.round(priceMedian * 0.7 + ppsfEstimate * 0.3);
+        }
+      }
+      return ppsfEstimate;
+    }
   }
 
-  return priceMedians_zipType[key] || priceMedians_zip[zip] || areaPriceMedian || 0;
+  return priceMedian;
 }
 
 export function scoreDealClient(property, overrideMedian) {

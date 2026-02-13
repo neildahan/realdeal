@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import axios from 'axios';
 import Sidebar from './components/Sidebar';
 import DealMap from './components/DealMap';
@@ -19,14 +19,16 @@ function App() {
 
   const [pipelineRunning, setPipelineRunning] = useState(false);
   const [searchLoading, setSearchLoading] = useState(false);
-  const [searchResults, setSearchResults] = useState(null); // null = no active search
-  const [searchLabel, setSearchLabel] = useState(''); // display name for the searched location
-  const [searchCoords, setSearchCoords] = useState(null); // { lat, lng } for API search
+  const [searchResults, setSearchResults] = useState(null);
+  const [searchLabel, setSearchLabel] = useState('');
+  const [searchCoords, setSearchCoords] = useState(null);
+  const [searchRadius, setSearchRadius] = useState(null); // miles, computed from bounding box
+  const [areaBounds, setAreaBounds] = useState(null); // visual boundary overlay on map
   const [mapCenter, setMapCenter] = useState(null);
   const [mapBounds, setMapBounds] = useState(null);
-  const [enrichProgress, setEnrichProgress] = useState(null); // { percent, message, current, total, phase }
+  const [enrichProgress, setEnrichProgress] = useState(null);
   const [noResults, setNoResults] = useState(false);
-  const searchCache = useRef({}); // { "lat,lng": { results, timestamp } }
+  const searchCache = useRef({});
   const { properties: dbProperties, loading, error, refetch } = useProperties();
 
   // Draw area state
@@ -34,26 +36,18 @@ function App() {
   const [drawnBounds, setDrawnBounds] = useState(null);
   const [areaMedian, setAreaMedian] = useState(null);
   const [areaListingCount, setAreaListingCount] = useState(0);
-  const [medianRange, setMedianRange] = useState(null); // { min, max }
+  const [medianRange, setMedianRange] = useState(null);
   const [drawSearchLoading, setDrawSearchLoading] = useState(false);
 
-  // When search is active, show search results; otherwise show DB properties
   const rawProperties = searchResults || dbProperties;
 
-  // When area median is active, use area-based scores automatically
   const scoredProperties = rawProperties.map((p) => {
     if (areaMedian && p._areaMedianScore != null) {
-      return {
-        ...p,
-        dealScore: p._areaMedianScore,
-        marketMedian: areaMedian,
-      };
+      return { ...p, dealScore: p._areaMedianScore, marketMedian: areaMedian };
     }
     return p;
   });
 
-  // Apply filters client-side on all properties for instant feedback.
-  // Backend also filters during search to paginate and fetch more matching results.
   const properties = scoredProperties.filter((p) => {
     if (filters.propertyType && p.propertyType !== filters.propertyType) return false;
     if (filters.minScore && (p.dealScore || 0) < filters.minScore) return false;
@@ -70,64 +64,58 @@ function App() {
     return true;
   });
 
-  async function handleTriggerPipeline() {
+  /**
+   * Compute radius in miles from a Nominatim bounding box [south, north, west, east].
+   */
+  function radiusFromBounds(bounds) {
+    if (!bounds || bounds.length < 4) return 5;
+    const [south, north, west, east] = bounds.map(Number);
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const centerLat = (south + north) / 2;
+    const dLat = toRad(north - south);
+    const dLng = toRad(east - west);
+    const a = Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(centerLat)) * Math.cos(toRad(centerLat)) * Math.sin(dLng / 2) ** 2;
+    const miles = 3959 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    // Clamp between 1 and 15 miles
+    return Math.max(1, Math.min(15, Math.round(miles * 10) / 10));
+  }
+
+  /**
+   * Run the SSE search pipeline for given coordinates.
+   */
+  const runSearch = useCallback(async (lat, lng, radius, currentFilters) => {
     setPipelineRunning(true);
     setEnrichProgress(null);
     setNoResults(false);
+
+    const cacheKey = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+    const filterKey = JSON.stringify(currentFilters);
+    const fullCacheKey = `${cacheKey}|${filterKey}`;
+    const cached = searchCache.current[fullCacheKey];
+
     try {
-      if (searchCoords) {
-        const cacheKey = `${searchCoords.lat.toFixed(4)},${searchCoords.lng.toFixed(4)}`;
-        const filterKey = JSON.stringify(filters);
-        const fullCacheKey = `${cacheKey}|${filterKey}`;
-        const cached = searchCache.current[fullCacheKey];
-
-        if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-          setSearchResults(cached.results);
-          setNoResults(cached.results.length === 0);
-          if (cached.areaMedian) {
-            setAreaMedian(cached.areaMedian);
-            setAreaListingCount(cached.results.length);
-          }
-        } else {
-          const needsEnrichment = filters.distressType === 'delinquent' || filters.distressType === 'taxLien';
-
-          if (needsEnrichment) {
-            // Use SSE stream for real-time progress
-            const params = new URLSearchParams({
-              latitude: searchCoords.lat,
-              longitude: searchCoords.lng,
-              filters: JSON.stringify(filters),
-            });
-            await new Promise((resolve, reject) => {
-              const es = new EventSource(`/api/properties/search/stream?${params}`);
-              es.addEventListener('progress', (e) => {
-                setEnrichProgress(JSON.parse(e.data));
-              });
-              es.addEventListener('results', (e) => {
-                const { results, areaMedian: serverMedian } = JSON.parse(e.data);
-                searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
-                setSearchResults(results || []);
-                setNoResults((results || []).length === 0);
-                if (serverMedian) {
-                  setAreaMedian(serverMedian);
-                  setAreaListingCount((results || []).length);
-                }
-                es.close();
-                resolve();
-              });
-              es.addEventListener('error', (e) => {
-                es.close();
-                reject(new Error('Stream error'));
-              });
-              es.onerror = () => { es.close(); reject(new Error('SSE connection error')); };
-            });
-          } else {
-            const res = await axios.post('/api/properties/search', {
-              latitude: searchCoords.lat,
-              longitude: searchCoords.lng,
-              filters,
-            });
-            const { results, areaMedian: serverMedian } = res.data;
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        setSearchResults(cached.results);
+        setNoResults(cached.results.length === 0);
+        if (cached.areaMedian) {
+          setAreaMedian(cached.areaMedian);
+          setAreaListingCount(cached.results.length);
+        }
+      } else {
+        const params = new URLSearchParams({
+          latitude: lat,
+          longitude: lng,
+          radius: radius || 5,
+          filters: JSON.stringify(currentFilters),
+        });
+        await new Promise((resolve, reject) => {
+          const es = new EventSource(`/api/properties/search/stream?${params}`);
+          es.addEventListener('progress', (e) => {
+            setEnrichProgress(JSON.parse(e.data));
+          });
+          es.addEventListener('results', (e) => {
+            const { results, areaMedian: serverMedian } = JSON.parse(e.data);
             searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
             setSearchResults(results || []);
             setNoResults((results || []).length === 0);
@@ -135,27 +123,40 @@ function App() {
               setAreaMedian(serverMedian);
               setAreaListingCount((results || []).length);
             }
-          }
-        }
-      } else if (drawnBounds) {
-        // Use drawn area as search region
-        await handleSearchDrawnArea();
-      } else {
-        const res = await axios.post('/api/properties/pipeline');
-        await refetch();
-        setNoResults(res.data?.saved === 0 && res.data?.enriched === 0);
+            es.close();
+            resolve();
+          });
+          es.addEventListener('error', () => {
+            es.close();
+            reject(new Error('Stream error'));
+          });
+          es.onerror = () => { es.close(); reject(new Error('SSE connection error')); };
+        });
       }
     } catch (err) {
-      console.error('Pipeline trigger failed:', err);
+      console.error('Search failed:', err);
     } finally {
       setPipelineRunning(false);
       setEnrichProgress(null);
     }
+  }, []);
+
+  /**
+   * "Find Deals" button — re-search current area with current filters.
+   */
+  async function handleTriggerPipeline() {
+    if (searchCoords) {
+      await runSearch(searchCoords.lat, searchCoords.lng, searchRadius, filters);
+    } else if (drawnBounds) {
+      await handleSearchDrawnArea();
+    }
   }
 
+  /**
+   * Location search: geocode → fly map + show area boundary. No auto-search.
+   */
   async function handleLocationSearch(query, resolvedGeo) {
     setSearchLoading(true);
-    // Clear draw state — mutual exclusivity
     setDrawMode(false);
     setDrawnBounds(null);
     setAreaMedian(null);
@@ -165,7 +166,7 @@ function App() {
     try {
       let lat, lng, bounds, label;
 
-      if (resolvedGeo) {
+      if (resolvedGeo && resolvedGeo.lat != null && resolvedGeo.lng != null) {
         lat = resolvedGeo.lat;
         lng = resolvedGeo.lng;
         bounds = resolvedGeo.boundingbox;
@@ -188,17 +189,29 @@ function App() {
         label = isZip ? query : result.display_name.split(',').slice(0, 2).join(',');
       }
 
+      // Compute radius from bounding box
+      const radius = radiusFromBounds(bounds);
+
+      // Build area bounds — fallback to ~2 mile box around center if no bounding box
+      let boundsArr;
+      if (bounds && bounds.length >= 4) {
+        const [south, north, west, east] = bounds.map(Number);
+        boundsArr = [[south, west], [north, east]];
+      } else {
+        const delta = 0.03; // ~2 miles
+        boundsArr = [[lat - delta, lng - delta], [lat + delta, lng + delta]];
+      }
+
       setMapCenter([lat, lng]);
       setSearchCoords({ lat, lng });
-      if (bounds) {
-        const [south, north, west, east] = bounds.map(Number);
-        setMapBounds([[south, west], [north, east]]);
-      }
+      setSearchRadius(radius);
+      setMapBounds(boundsArr);
+      setAreaBounds(boundsArr);
       setSearchLabel(label);
       setSearchResults(null);
+      setSearchLoading(false);
     } catch (err) {
       console.error('Location lookup failed:', err);
-    } finally {
       setSearchLoading(false);
     }
   }
@@ -207,9 +220,10 @@ function App() {
     setSearchResults(null);
     setSearchLabel('');
     setSearchCoords(null);
+    setSearchRadius(null);
     setMapCenter(null);
     setMapBounds(null);
-    // Also clear draw state
+    setAreaBounds(null);
     setDrawMode(false);
     setDrawnBounds(null);
     setAreaMedian(null);
@@ -221,10 +235,10 @@ function App() {
     const entering = !drawMode;
     setDrawMode(entering);
     if (entering) {
-      // Clear location search — mutual exclusivity
       setSearchResults(null);
       setSearchLabel('');
       setSearchCoords(null);
+      setSearchRadius(null);
     }
   }
 
@@ -240,15 +254,13 @@ function App() {
   function handleDrawComplete(bounds) {
     setDrawMode(false);
     setDrawnBounds(bounds);
-    // Just save the rectangle — no API call until button press
     setAreaMedian(null);
     setAreaListingCount(0);
     setMedianRange(null);
-
     setSearchResults(null);
     setSearchLabel('');
     setSearchCoords(null);
-    // Fly map to the drawn area
+    setSearchRadius(null);
     setMapBounds(bounds);
   }
 
@@ -262,7 +274,6 @@ function App() {
       const centerLat = (sw.lat + ne.lat) / 2;
       const centerLng = (sw.lng + ne.lng) / 2;
 
-      // Haversine distance from center to corner (in miles)
       const toRad = (deg) => (deg * Math.PI) / 180;
       const dLat = toRad(ne.lat - centerLat);
       const dLng = toRad(ne.lng - centerLng);
@@ -280,7 +291,6 @@ function App() {
 
       const allResults = res.data?.results || [];
 
-      // Filter to only properties inside the drawn rectangle
       const filtered = allResults.filter((p) => {
         const coords = p.coordinates?.coordinates;
         if (!coords || (coords[0] === 0 && coords[1] === 0)) return false;
@@ -289,11 +299,9 @@ function App() {
         return pLat >= sw.lat && pLat <= ne.lat && pLng >= sw.lng && pLng <= ne.lng;
       });
 
-      // Compute $/sqft market data for accurate per-property estimates
       const marketData = computeMarketData(filtered);
       const drawnAreaMedian = marketData.areaPriceMedian;
 
-      // Re-score each property with its $/sqft-based market estimate
       const rescored = filtered.map((p) => {
         const bestMedian = estimateMarketValue(p, marketData);
         return {
@@ -305,7 +313,6 @@ function App() {
         };
       });
 
-      // Compute median range across all unique medians
       const uniqueMedians = [...new Set(rescored.map((p) => p.marketMedian).filter(Boolean))];
       const minMedian = Math.min(...uniqueMedians);
       const maxMedian = Math.max(...uniqueMedians);
@@ -332,6 +339,7 @@ function App() {
         onLocationSearch={handleLocationSearch}
         searchLoading={searchLoading}
         searchLabel={searchLabel}
+        hasLocation={!!searchCoords}
         onClearSearch={handleClearSearch}
         drawMode={drawMode}
         onToggleDrawMode={handleToggleDrawMode}
@@ -346,12 +354,10 @@ function App() {
       />
 
       <div className="flex-1 relative overflow-hidden">
-        {loading && properties.length === 0 && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-950 z-50">
-            <div className="text-center">
-              <Loader2 className="w-8 h-8 animate-spin text-emerald-400 mx-auto mb-2" />
-              <p className="text-gray-400 text-sm">Loading deals...</p>
-            </div>
+        {noResults && !pipelineRunning && !drawSearchLoading && (
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-gray-900/90 border border-gray-700 rounded-xl px-8 py-6 text-center">
+            <p className="text-gray-300 font-semibold mb-1">No deals found</p>
+            <p className="text-gray-500 text-sm">Try a different location or adjust your filters.</p>
           </div>
         )}
 
@@ -361,14 +367,6 @@ function App() {
           </div>
         )}
 
-        {noResults && !pipelineRunning && !drawSearchLoading && (
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-gray-900/90 border border-gray-700 rounded-xl px-8 py-6 text-center">
-            <p className="text-gray-300 font-semibold mb-1">No deals found</p>
-            <p className="text-gray-500 text-sm">Try a different location or adjust your filters.</p>
-          </div>
-        )}
-
-        {/* Draw mode indicator */}
         {drawMode && (
           <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1001] bg-emerald-900/90 border border-emerald-600 rounded-lg px-4 py-2 text-sm text-emerald-300 font-medium pointer-events-none">
             Click and drag on the map to draw a search area
@@ -392,7 +390,9 @@ function App() {
                 <p className="text-white font-semibold text-base">
                   {enrichProgress.phase === 'fetching' && 'Fetching Listings'}
                   {enrichProgress.phase === 'fetched' && 'Listings Found'}
+                  {enrichProgress.phase === 'refining' && 'Refining Valuations'}
                   {enrichProgress.phase === 'enriching' && 'Checking Distress Signals'}
+                  {enrichProgress.phase === 'validating' && 'Verifying Top Deals'}
                   {enrichProgress.phase === 'done' && 'Complete'}
                 </p>
               </div>
@@ -420,6 +420,7 @@ function App() {
           properties={properties}
           center={mapCenter}
           bounds={mapBounds}
+          areaBounds={areaBounds}
           drawMode={drawMode}
           drawnBounds={drawnBounds}
           onDrawComplete={handleDrawComplete}
@@ -444,7 +445,6 @@ function App() {
           </div>
         </div>
 
-        {/* Listing Carousel - only show when we have search results */}
         {searchResults && properties.length > 0 && (
           <ListingCarousel
             properties={properties}

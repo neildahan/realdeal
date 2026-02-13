@@ -48,6 +48,121 @@ function median(arr) {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+// Helper: trimmed median — removes top/bottom 15% outliers before computing median
+function trimmedMedian(arr) {
+  if (arr.length < 5) return median(arr);
+  const sorted = [...arr].sort((a, b) => a - b);
+  const trim = Math.floor(sorted.length * 0.15);
+  return median(sorted.slice(trim, sorted.length - trim));
+}
+
+// Helper: check if a zestimate is plausible for this listing
+function isZestimateReliable(zestimate, listing) {
+  if (!zestimate || zestimate <= 0 || !listing.price || listing.price <= 0) return false;
+  const ratio = zestimate / listing.price;
+  // If zestimate is >2.5x or <0.4x the listing price, it's likely a building/lot value
+  if (ratio > 2.5 || ratio < 0.4) return false;
+  // For condos: also check $/sqft sanity — a $3M zestimate on 764sqft = $3,927/sqft is absurd
+  if (listing.sqft && listing.sqft > 0) {
+    const zestPpsf = zestimate / listing.sqft;
+    if (zestPpsf > 2000) return false; // No US condo is genuinely $2,000+/sqft in most markets
+  }
+  return true;
+}
+
+/**
+ * Compute $/sqft medians grouped by zip+type and zip for accurate per-property estimates.
+ * Uses trimmed medians to remove luxury/outlier skew.
+ */
+function computeMarketData(listings) {
+  const MIN_SAMPLES = 3;
+
+  const ppsf_zipType = {};   // "33131|condo" => [$/sqft values]
+  const ppsf_zip = {};       // "33131" => [$/sqft values]
+  const price_zipType = {};
+  const price_zip = {};
+
+  for (const l of listings) {
+    const zip = l.address?.zip || 'unknown';
+    const type = l.propertyType || 'unknown';
+    const price = l.price;
+    if (!price || price <= 0) continue;
+
+    const key = `${zip}|${type}`;
+
+    if (l.sqft && l.sqft > 0) {
+      const ppsf = price / l.sqft;
+      if (!ppsf_zipType[key]) ppsf_zipType[key] = [];
+      ppsf_zipType[key].push(ppsf);
+      if (!ppsf_zip[zip]) ppsf_zip[zip] = [];
+      ppsf_zip[zip].push(ppsf);
+    }
+
+    if (!price_zipType[key]) price_zipType[key] = [];
+    price_zipType[key].push(price);
+    if (!price_zip[zip]) price_zip[zip] = [];
+    price_zip[zip].push(price);
+  }
+
+  // Use trimmed medians to remove outlier skew (luxury penthouses, etc.)
+  const ppsfMedians_zipType = {};
+  for (const [key, vals] of Object.entries(ppsf_zipType)) {
+    if (vals.length >= MIN_SAMPLES) ppsfMedians_zipType[key] = trimmedMedian(vals);
+  }
+  const ppsfMedians_zip = {};
+  for (const [zip, vals] of Object.entries(ppsf_zip)) {
+    if (vals.length >= MIN_SAMPLES) ppsfMedians_zip[zip] = trimmedMedian(vals);
+  }
+  const priceMedians_zipType = {};
+  for (const [key, vals] of Object.entries(price_zipType)) {
+    if (vals.length >= MIN_SAMPLES) priceMedians_zipType[key] = trimmedMedian(vals);
+  }
+  const priceMedians_zip = {};
+  for (const [zip, vals] of Object.entries(price_zip)) {
+    priceMedians_zip[zip] = trimmedMedian(vals);
+  }
+
+  const allPpsf = Object.values(ppsf_zip).flat();
+  const areaPpsfMedian = trimmedMedian(allPpsf);
+  const allPrices = listings.map((l) => l.price).filter((p) => p && p > 0);
+  const areaPriceMedian = trimmedMedian(allPrices);
+
+  return {
+    ppsfMedians_zipType, ppsfMedians_zip, areaPpsfMedian,
+    priceMedians_zipType, priceMedians_zip, areaPriceMedian,
+  };
+}
+
+/**
+ * Estimate market value for a single listing.
+ * Priority: verified zestimate > $/sqft estimate > raw price median
+ */
+function estimateMarketValue(listing, marketData) {
+  const {
+    ppsfMedians_zipType, ppsfMedians_zip, areaPpsfMedian,
+    priceMedians_zipType, priceMedians_zip, areaPriceMedian,
+  } = marketData;
+
+  // 1. Per-property zestimate — only if it passes sanity checks
+  if (isZestimateReliable(listing.zestimate, listing)) {
+    return listing.zestimate;
+  }
+
+  const zip = listing.address?.zip || 'unknown';
+  const type = listing.propertyType || 'unknown';
+  const key = `${zip}|${type}`;
+  const sqft = listing.sqft;
+
+  // 2. $/sqft estimate (size-adjusted)
+  if (sqft && sqft > 0) {
+    const ppsf = ppsfMedians_zipType[key] || ppsfMedians_zip[zip] || areaPpsfMedian;
+    if (ppsf > 0) return Math.round(ppsf * sqft);
+  }
+
+  // 3. Raw price median fallback
+  return priceMedians_zipType[key] || priceMedians_zip[zip] || areaPriceMedian || 0;
+}
+
 // POST /api/properties/search - Search by location via Zillow (with server-side filtering)
 router.post('/search', async (req, res) => {
   try {
@@ -90,16 +205,16 @@ router.post('/search', async (req, res) => {
       page++;
     }
 
-    // --- Phase 2: Calculate area median from all listing prices ---
-    const prices = allListings.map((l) => l.price).filter((p) => p && p > 0);
-    const areaMedian = median(prices);
-    console.log(`Search: area median = $${areaMedian.toLocaleString()} from ${prices.length} listings`);
+    // --- Phase 2: Compute $/sqft market data for accurate per-property estimates ---
+    const marketData = computeMarketData(allListings);
+    const areaMedian = marketData.areaPriceMedian;
+    console.log(`Search: $/sqft medians — ${Object.keys(marketData.ppsfMedians_zipType).length} zip+type, ${Object.keys(marketData.ppsfMedians_zip).length} zip, area $/sqft = $${Math.round(marketData.areaPpsfMedian)}`);
 
-    // --- Phase 3: Backfill marketMedian, batch enrich, score, and filter ---
+    // --- Phase 3: Estimate market value per listing, enrich, score, and filter ---
     let results = [];
 
     for (const listing of allListings) {
-      if (!listing.marketMedian && areaMedian > 0) listing.marketMedian = areaMedian;
+      listing.marketMedian = estimateMarketValue(listing, marketData);
     }
 
     if (needsEnrichment) {
@@ -207,11 +322,11 @@ router.get('/search/stream', async (req, res) => {
       page++;
     }
 
-    // Phase 2: Area median + pre-fill market values
-    const prices = allListings.map((l) => l.price).filter((p) => p && p > 0);
-    const areaMedian = median(prices);
+    // Phase 2: Compute $/sqft market data for per-property estimates
+    const marketData = computeMarketData(allListings);
+    const areaMedian = marketData.areaPriceMedian;
     for (const listing of allListings) {
-      if (!listing.marketMedian && areaMedian > 0) listing.marketMedian = areaMedian;
+      listing.marketMedian = estimateMarketValue(listing, marketData);
     }
 
     // Phase 3: Batch enrich only promising listings

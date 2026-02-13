@@ -3,7 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const propertyRoutes = require('./routes/properties');
-const { startCronPipeline } = require('./services/pipeline');
+// Cron pipeline disabled — ATTOM calls only happen on explicit user searches
+// const { startCronPipeline } = require('./services/pipeline');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -24,8 +25,9 @@ connectDB().then(() => {
   app.listen(PORT, () => {
     console.log(`RealDeal backend running on port ${PORT}`);
 
-    // Start the scrape -> enrich -> score pipeline (every 30 min)
-    startCronPipeline();
+    // Cron pipeline disabled to save ATTOM API calls.
+    // Enrichment only runs when user explicitly searches with distress filters.
+    // Manual pipeline trigger still available via POST /api/properties/pipeline.
   });
 });
 

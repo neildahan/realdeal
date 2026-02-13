@@ -177,6 +177,9 @@ export default function DealMap({ properties, center: centerProp, bounds: bounds
                   <p className="text-sm font-semibold text-white truncate">{property.address?.street}</p>
                   <p className="text-xs text-gray-500 truncate">
                     {property.address?.city}, {property.address?.state} {property.address?.zip}
+                    {property.propertyType && property.propertyType !== 'unknown' && (
+                      <span className="ml-1.5 text-gray-600">&middot; {property.propertyType.replace(/([A-Z])/g, ' $1').trim()}</span>
+                    )}
                   </p>
 
                   <div className="flex items-baseline gap-2 mt-1.5">

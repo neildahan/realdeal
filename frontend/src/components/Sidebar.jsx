@@ -36,7 +36,7 @@ const PROPERTY_TYPE_OPTIONS = [
   { value: 'manufactured', label: 'Manufactured' },
 ];
 
-export default function Sidebar({ filters, setFilters, properties, onTriggerPipeline, pipelineRunning, onLocationSearch, searchLoading, searchLabel, onClearSearch, drawMode, onToggleDrawMode, drawnBounds, onClearDraw, areaMedian, areaListingCount, drawSearchLoading, onSearchDrawnArea }) {
+export default function Sidebar({ filters, setFilters, properties, onTriggerPipeline, pipelineRunning, onLocationSearch, searchLoading, searchLabel, onClearSearch, drawMode, onToggleDrawMode, drawnBounds, onClearDraw, areaMedian, areaListingCount, drawSearchLoading, onSearchDrawnArea, hasSearchResults, medianRange }) {
   const [searchInput, setSearchInput] = useState('');
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -223,43 +223,30 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
               </button>
             </div>
 
-            {/* Search This Area button */}
-            {!areaMedian && (
-              <button
-                onClick={onSearchDrawnArea}
-                disabled={drawSearchLoading}
-                className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm font-medium py-2 px-4 rounded-lg transition-colors"
-              >
-                {drawSearchLoading ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Search className="w-4 h-4" />
-                )}
-                {drawSearchLoading ? 'Searching...' : 'Search This Area'}
-              </button>
-            )}
+            <p className="text-xs text-gray-500">Click "Find Deals" to search this area</p>
 
-            {/* Area Median Display */}
+            {/* Market Median Display */}
             {areaMedian != null && areaMedian > 0 && (
               <div className="bg-gray-800 rounded-lg p-3 space-y-1">
                 <div className="flex items-center gap-1.5 text-xs text-gray-400">
                   <BarChart3 className="w-3 h-3" />
-                  Area Market Median
+                  Market Medians
                 </div>
-                <p className="text-lg font-bold text-emerald-400">
-                  ${areaMedian.toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                </p>
+                {medianRange && medianRange.min !== medianRange.max ? (
+                  <p className="text-lg font-bold text-emerald-400">
+                    ${medianRange.min.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    <span className="text-gray-500 mx-1">-</span>
+                    ${medianRange.max.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                  </p>
+                ) : (
+                  <p className="text-lg font-bold text-emerald-400">
+                    ${areaMedian.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                  </p>
+                )}
                 <p className="text-[11px] text-gray-500">
-                  Based on {areaListingCount} listing{areaListingCount !== 1 ? 's' : ''} in drawn area
+                  {areaListingCount} listing{areaListingCount !== 1 ? 's' : ''} &middot; varies by zip &amp; property type
                 </p>
               </div>
-            )}
-
-            {/* Scoring note */}
-            {areaMedian != null && areaMedian > 0 && (
-              <p className="text-[11px] text-gray-500">
-                Deal scores are based on the area median above
-              </p>
             )}
           </div>
         )}
@@ -284,15 +271,15 @@ export default function Sidebar({ filters, setFilters, properties, onTriggerPipe
       {/* Stats */}
       <div className="p-4 border-b border-gray-800 grid grid-cols-3 gap-2">
         <div className="bg-gray-800 rounded-lg p-3 text-center">
-          <p className="text-2xl font-bold text-white">{properties.length}</p>
+          <p className="text-2xl font-bold text-white">{hasSearchResults ? properties.length : '-'}</p>
           <p className="text-xs text-gray-400">Total</p>
         </div>
         <div className="bg-gray-800 rounded-lg p-3 text-center">
-          <p className="text-2xl font-bold text-red-400">{hotDeals}</p>
+          <p className="text-2xl font-bold text-red-400">{hasSearchResults ? hotDeals : '-'}</p>
           <p className="text-xs text-gray-400">Hot</p>
         </div>
         <div className="bg-gray-800 rounded-lg p-3 text-center">
-          <p className="text-2xl font-bold text-yellow-400">{warmDeals}</p>
+          <p className="text-2xl font-bold text-yellow-400">{hasSearchResults ? warmDeals : '-'}</p>
           <p className="text-xs text-gray-400">Warm</p>
         </div>
       </div>

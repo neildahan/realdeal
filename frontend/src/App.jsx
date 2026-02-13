@@ -4,7 +4,7 @@ import Sidebar from './components/Sidebar';
 import DealMap from './components/DealMap';
 import ListingCarousel from './components/ListingCarousel';
 import { useProperties } from './hooks/useProperties';
-import { calculateMedian, scoreDealClient } from './utils/clientScorer';
+import { computeMarketData, estimateMarketValue, scoreDealClient } from './utils/clientScorer';
 import { Loader2 } from 'lucide-react';
 
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
@@ -25,6 +25,7 @@ function App() {
   const [mapCenter, setMapCenter] = useState(null);
   const [mapBounds, setMapBounds] = useState(null);
   const [enrichProgress, setEnrichProgress] = useState(null); // { percent, message, current, total, phase }
+  const [noResults, setNoResults] = useState(false);
   const searchCache = useRef({}); // { "lat,lng": { results, timestamp } }
   const { properties: dbProperties, loading, error, refetch } = useProperties();
 
@@ -33,6 +34,7 @@ function App() {
   const [drawnBounds, setDrawnBounds] = useState(null);
   const [areaMedian, setAreaMedian] = useState(null);
   const [areaListingCount, setAreaListingCount] = useState(0);
+  const [medianRange, setMedianRange] = useState(null); // { min, max }
   const [drawSearchLoading, setDrawSearchLoading] = useState(false);
 
   // When search is active, show search results; otherwise show DB properties
@@ -71,6 +73,7 @@ function App() {
   async function handleTriggerPipeline() {
     setPipelineRunning(true);
     setEnrichProgress(null);
+    setNoResults(false);
     try {
       if (searchCoords) {
         const cacheKey = `${searchCoords.lat.toFixed(4)},${searchCoords.lng.toFixed(4)}`;
@@ -80,6 +83,7 @@ function App() {
 
         if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
           setSearchResults(cached.results);
+          setNoResults(cached.results.length === 0);
           if (cached.areaMedian) {
             setAreaMedian(cached.areaMedian);
             setAreaListingCount(cached.results.length);
@@ -103,6 +107,7 @@ function App() {
                 const { results, areaMedian: serverMedian } = JSON.parse(e.data);
                 searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
                 setSearchResults(results || []);
+                setNoResults((results || []).length === 0);
                 if (serverMedian) {
                   setAreaMedian(serverMedian);
                   setAreaListingCount((results || []).length);
@@ -125,15 +130,20 @@ function App() {
             const { results, areaMedian: serverMedian } = res.data;
             searchCache.current[fullCacheKey] = { results: results || [], areaMedian: serverMedian, timestamp: Date.now() };
             setSearchResults(results || []);
+            setNoResults((results || []).length === 0);
             if (serverMedian) {
               setAreaMedian(serverMedian);
               setAreaListingCount((results || []).length);
             }
           }
         }
+      } else if (drawnBounds) {
+        // Use drawn area as search region
+        await handleSearchDrawnArea();
       } else {
-        await axios.post('/api/properties/pipeline');
+        const res = await axios.post('/api/properties/pipeline');
         await refetch();
+        setNoResults(res.data?.saved === 0 && res.data?.enriched === 0);
       }
     } catch (err) {
       console.error('Pipeline trigger failed:', err);
@@ -150,6 +160,7 @@ function App() {
     setDrawnBounds(null);
     setAreaMedian(null);
     setAreaListingCount(0);
+    setMedianRange(null);
 
     try {
       let lat, lng, bounds, label;
@@ -203,7 +214,7 @@ function App() {
     setDrawnBounds(null);
     setAreaMedian(null);
     setAreaListingCount(0);
-
+    setMedianRange(null);
   }
 
   function handleToggleDrawMode() {
@@ -222,7 +233,7 @@ function App() {
     setDrawnBounds(null);
     setAreaMedian(null);
     setAreaListingCount(0);
-
+    setMedianRange(null);
     setSearchResults(null);
   }
 
@@ -232,6 +243,7 @@ function App() {
     // Just save the rectangle — no API call until button press
     setAreaMedian(null);
     setAreaListingCount(0);
+    setMedianRange(null);
 
     setSearchResults(null);
     setSearchLabel('');
@@ -277,20 +289,30 @@ function App() {
         return pLat >= sw.lat && pLat <= ne.lat && pLng >= sw.lng && pLng <= ne.lng;
       });
 
-      // Calculate area median from filtered prices
-      const prices = filtered.map((p) => p.price).filter((p) => p && p > 0);
-      const median = calculateMedian(prices);
+      // Compute $/sqft market data for accurate per-property estimates
+      const marketData = computeMarketData(filtered);
+      const drawnAreaMedian = marketData.areaPriceMedian;
 
-      // Re-score each property with the area median
-      const rescored = filtered.map((p) => ({
-        ...p,
-        _originalScore: p.dealScore,
-        _originalMedian: p.marketMedian,
-        _areaMedianScore: scoreDealClient(p, median),
-      }));
+      // Re-score each property with its $/sqft-based market estimate
+      const rescored = filtered.map((p) => {
+        const bestMedian = estimateMarketValue(p, marketData);
+        return {
+          ...p,
+          _originalScore: p.dealScore,
+          _originalMedian: p.marketMedian,
+          marketMedian: bestMedian,
+          _areaMedianScore: scoreDealClient(p, bestMedian),
+        };
+      });
+
+      // Compute median range across all unique medians
+      const uniqueMedians = [...new Set(rescored.map((p) => p.marketMedian).filter(Boolean))];
+      const minMedian = Math.min(...uniqueMedians);
+      const maxMedian = Math.max(...uniqueMedians);
 
       setSearchResults(rescored);
-      setAreaMedian(median);
+      setAreaMedian(drawnAreaMedian);
+      setMedianRange(uniqueMedians.length > 1 ? { min: minMedian, max: maxMedian } : null);
       setAreaListingCount(filtered.length);
     } catch (err) {
       console.error('Draw area search failed:', err);
@@ -319,6 +341,8 @@ function App() {
         areaListingCount={areaListingCount}
         drawSearchLoading={drawSearchLoading}
         onSearchDrawnArea={handleSearchDrawnArea}
+        hasSearchResults={searchResults !== null}
+        medianRange={medianRange}
       />
 
       <div className="flex-1 relative overflow-hidden">
@@ -337,9 +361,9 @@ function App() {
           </div>
         )}
 
-        {searchResults && properties.length === 0 && !pipelineRunning && !drawSearchLoading && (
+        {noResults && !pipelineRunning && !drawSearchLoading && (
           <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 bg-gray-900/90 border border-gray-700 rounded-xl px-8 py-6 text-center">
-            <p className="text-gray-300 font-semibold mb-1">No listings found</p>
+            <p className="text-gray-300 font-semibold mb-1">No deals found</p>
             <p className="text-gray-500 text-sm">Try a different location or adjust your filters.</p>
           </div>
         )}
@@ -420,17 +444,19 @@ function App() {
           </div>
         </div>
 
-        {/* Listing Carousel */}
-        <ListingCarousel
-          properties={properties}
-          onSelectProperty={(p) => {
-            const coords = p.coordinates?.coordinates;
-            if (coords && !(coords[0] === 0 && coords[1] === 0)) {
-              setMapCenter([coords[1], coords[0]]);
-              setMapBounds(null);
-            }
-          }}
-        />
+        {/* Listing Carousel - only show when we have search results */}
+        {searchResults && properties.length > 0 && (
+          <ListingCarousel
+            properties={properties}
+            onSelectProperty={(p) => {
+              const coords = p.coordinates?.coordinates;
+              if (coords && !(coords[0] === 0 && coords[1] === 0)) {
+                setMapCenter([coords[1], coords[0]]);
+                setMapBounds(null);
+              }
+            }}
+          />
+        )}
       </div>
     </div>
   );

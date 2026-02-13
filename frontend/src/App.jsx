@@ -48,7 +48,20 @@ function App() {
     return p;
   });
 
+  // Determine active geographic bounds (location search OR drawn area)
+  const activeBounds = areaBounds || drawnBounds;
+
   const properties = scoredProperties.filter((p) => {
+    // Geographic bounds filter — only show pins inside the search area
+    if (activeBounds) {
+      const coords = p.coordinates?.coordinates;
+      if (!coords || (coords[0] === 0 && coords[1] === 0)) return false;
+      const pLat = coords[1];
+      const pLng = coords[0];
+      const [[south, west], [north, east]] = activeBounds;
+      if (pLat < south || pLat > north || pLng < west || pLng > east) return false;
+    }
+
     if (filters.propertyType && p.propertyType !== filters.propertyType) return false;
     if (filters.minScore && (p.dealScore || 0) < filters.minScore) return false;
     if (filters.minDiscount) {
@@ -84,14 +97,15 @@ function App() {
   /**
    * Run the SSE search pipeline for given coordinates.
    */
-  const runSearch = useCallback(async (lat, lng, radius, currentFilters) => {
+  const runSearch = useCallback(async (lat, lng, radius, currentFilters, searchBounds) => {
     setPipelineRunning(true);
     setEnrichProgress(null);
     setNoResults(false);
 
     const cacheKey = `${lat.toFixed(4)},${lng.toFixed(4)}`;
     const filterKey = JSON.stringify(currentFilters);
-    const fullCacheKey = `${cacheKey}|${filterKey}`;
+    const boundsKey = searchBounds ? JSON.stringify(searchBounds) : 'none';
+    const fullCacheKey = `${cacheKey}|${filterKey}|${boundsKey}`;
     const cached = searchCache.current[fullCacheKey];
 
     try {
@@ -109,6 +123,9 @@ function App() {
           radius: radius || 5,
           filters: JSON.stringify(currentFilters),
         });
+        if (searchBounds) {
+          params.set('bounds', JSON.stringify(searchBounds));
+        }
         await new Promise((resolve, reject) => {
           const es = new EventSource(`/api/properties/search/stream?${params}`);
           es.addEventListener('progress', (e) => {
@@ -146,7 +163,7 @@ function App() {
    */
   async function handleTriggerPipeline() {
     if (searchCoords) {
-      await runSearch(searchCoords.lat, searchCoords.lng, searchRadius, filters);
+      await runSearch(searchCoords.lat, searchCoords.lng, searchRadius, filters, areaBounds);
     } else if (drawnBounds) {
       await handleSearchDrawnArea();
     }
@@ -162,6 +179,8 @@ function App() {
     setAreaMedian(null);
     setAreaListingCount(0);
     setMedianRange(null);
+    // Clear search cache so stale results from previous searches don't persist
+    searchCache.current = {};
 
     try {
       let lat, lng, bounds, label;
@@ -282,21 +301,19 @@ function App() {
         Math.cos(toRad(centerLat)) * Math.cos(toRad(ne.lat)) * Math.sin(dLng / 2) ** 2;
       const radiusMiles = 3959 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
+      const boundsArr = [[sw.lat, sw.lng], [ne.lat, ne.lng]];
       const res = await axios.post('/api/properties/search', {
         latitude: centerLat,
         longitude: centerLng,
         radius: Math.max(radiusMiles, 0.5),
         filters,
+        bounds: boundsArr,
       });
 
-      const allResults = res.data?.results || [];
-
-      const filtered = allResults.filter((p) => {
+      // Results are already bounds-filtered by the backend
+      const filtered = (res.data?.results || []).filter((p) => {
         const coords = p.coordinates?.coordinates;
-        if (!coords || (coords[0] === 0 && coords[1] === 0)) return false;
-        const pLat = coords[1];
-        const pLng = coords[0];
-        return pLat >= sw.lat && pLat <= ne.lat && pLng >= sw.lng && pLng <= ne.lng;
+        return coords && !(coords[0] === 0 && coords[1] === 0);
       });
 
       const marketData = computeMarketData(filtered);

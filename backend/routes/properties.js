@@ -213,8 +213,9 @@ router.post('/search', async (req, res) => {
     }
 
     const { propertyType, distressType, minScore, minDiscount } = filters || {};
+    const bounds = req.body.bounds || null; // [[south, west], [north, east]]
     const needsEnrichment = distressType === 'delinquent' || distressType === 'taxLien';
-    const MAX_PAGES = 3;
+    const MAX_PAGES = 1;
     const MIN_RESULTS = 20;
 
     // --- Phase 1: Fetch all raw listings (with basic pre-filters) ---
@@ -236,6 +237,17 @@ router.post('/search', async (req, res) => {
 
         // As-is filter (from listing description keywords)
         if (distressType === 'asIs' && !listing.distressIndicators?.isAsIs) continue;
+
+        // Geographic bounds filter — only keep properties inside the search area
+        if (bounds) {
+          const coords = listing.coordinates?.coordinates;
+          if (coords && !(coords[0] === 0 && coords[1] === 0)) {
+            const pLat = coords[1];
+            const pLng = coords[0];
+            const [sw, ne] = bounds;
+            if (pLat < sw[0] || pLat > ne[0] || pLng < sw[1] || pLng > ne[1]) continue;
+          }
+        }
 
         allListings.push(listing);
       }
@@ -336,7 +348,7 @@ router.get('/search/stream', async (req, res) => {
   }
 
   try {
-    const { latitude, longitude, radius, filters: filtersJson } = req.query;
+    const { latitude, longitude, radius, filters: filtersJson, bounds: boundsJson } = req.query;
     if (!latitude || !longitude) {
       send('error', { error: 'latitude and longitude are required' });
       return res.end();
@@ -346,13 +358,14 @@ router.get('/search/stream', async (req, res) => {
     const lng = parseFloat(longitude);
     const rad = parseFloat(radius) || 10;
     const filters = filtersJson ? JSON.parse(filtersJson) : {};
+    const bounds = boundsJson ? JSON.parse(boundsJson) : null; // [[south, west], [north, east]]
     const { propertyType, distressType, minScore, minDiscount } = filters;
     const needsEnrichment = distressType === 'delinquent' || distressType === 'taxLien';
 
     send('progress', { phase: 'fetching', message: 'Fetching listings...', percent: 5 });
 
-    // Phase 1: Fetch listings
-    const MAX_PAGES = 3;
+    // Phase 1: Fetch listings (single page — Zillow returns plenty per page)
+    const MAX_PAGES = 1;
     const MIN_RESULTS = 20;
     let allListings = [];
     let page = 1;
@@ -367,6 +380,18 @@ router.get('/search/stream', async (req, res) => {
         if (propertyType && listing.propertyType !== propertyType) continue;
         if (distressType === 'preForeclosure' && listing.listingStatus !== 'preForeclosure') continue;
         if (distressType === 'asIs' && !listing.distressIndicators?.isAsIs) continue;
+
+        // Geographic bounds filter — only keep properties inside the search area
+        if (bounds) {
+          const coords = listing.coordinates?.coordinates;
+          if (coords && !(coords[0] === 0 && coords[1] === 0)) {
+            const pLat = coords[1];
+            const pLng = coords[0];
+            const [sw, ne] = bounds;
+            if (pLat < sw[0] || pLat > ne[0] || pLng < sw[1] || pLng > ne[1]) continue;
+          }
+        }
+
         allListings.push(listing);
       }
 
